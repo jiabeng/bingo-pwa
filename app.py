@@ -3,7 +3,7 @@
 import os, sys, json, csv, sqlite3, threading, time, re
 from datetime import datetime, date, timedelta
 from collections import Counter
-from flask import Flask, jsonify, render_template, send_from_directory, request
+from flask import Flask, jsonify, render_template, send_from_directory, request, send_file
 import requests
 from bs4 import BeautifulSoup
 
