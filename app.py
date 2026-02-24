@@ -113,23 +113,33 @@ def polling_loop():
 threading.Thread(target=polling_loop, daemon=True).start()
 
 # ---- HTML 解析：抓取今天所有已開獎期數（官網公開頁面）----
-def parse_today_from_official_html():
+def parse_today_from_official_html(debug_save=True):
     """
     從台彩 Bingo Bingo 官方今日頁面抓取『今天所有已開獎期別』。
-    回傳 list[dict]（與 DB 欄位對齊）：
-      { draw_term:int, draw_time:strISO(只保日), open_order:list[str], super_number:int, high_low, odd_even }
+    回傳 list[dict]：
+      { draw_term:int, draw_time:strISO(只保當日), open_order:list[str], super_number:int, high_low, odd_even }
+    策略：
+      1) 嘗試多個候選 URL（官網若調整路徑，任一可用即可）
+      2) 先用較寬鬆的 selector 找大容器，再以 regex 就近抽期別+20顆球
+      3) 退而求其次：全頁文字回掃（global regex）
+      4) 再退：掃描 <script> 內的 JSON（若頁面是前端框架渲染，常有嵌入資料）
+      5) 失敗時會把 HTML 存到 data/last_today.html 以便之後調整 selector
     """
     candidate_urls = [
         "https://www.taiwanlottery.com/lottery/Lotto/BingoBingo",
+        # 日後若官網提供日期參數，可在此補上變體
+        # f"https://www.taiwanlottery.com/lottery/Lotto/BingoBingo?Date={date.today().isoformat()}",
     ]
-    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"}
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"}
 
     html = None
+    used_url = None
     for url in candidate_urls:
         try:
-            res = requests.get(url, headers=ua, timeout=12, verify=False)
+            res = requests.get(url, headers=ua, timeout=15, verify=False)
             if res.status_code == 200 and len(res.text) > 1500:
                 html = res.text
+                used_url = url
                 break
         except Exception as e:
             print("[WARN] fetch official html failed:", e, file=sys.stderr)
@@ -137,53 +147,137 @@ def parse_today_from_official_html():
     if not html:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
-    # 嘗試找大型容器（保守做法），再用 regex 抽取期別與 20 顆數字
-    containers = []
-    for sel in ['[id*="today"]','[class*="today"]','[id*="bingo"]','[class*="bingo"]','section','div']:
-        containers.extend(soup.select(sel))
-    containers = [c for c in containers if c.get_text(strip=True) and len(c.get_text()) > 500]
+    # 除錯：把原始 HTML 存一份，方便必要時檢視頁面實際結構
+    if debug_save:
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(os.path.join("data", "last_today.html"), "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception as e:
+            print("[WARN] save last_today.html fail:", e, file=sys.stderr)
 
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 正則：期別（8~12位數）與 20 顆球
     term_re = re.compile(r"(?:第)?(\d{8,12})\s*期")
-    nums_re = re.compile(r"(?:(?:^|\\D)(\\d{1,2})(?!\\d)(?:(?:\\s|,|、|，))+){19}(\\d{1,2})(?!\\d)")
+    # 允許「數字 + 分隔符」連續19次，最後一顆再接一個數字（總共20顆）
+    nums_re = re.compile(r"(?:(?:^|\D)(\d{1,2})(?!\d)(?:(?:\s|,|、|，|．|・|:|；|/|-))+){19}(\d{1,2})(?!\d)")
 
     def z2(n: str) -> str:
         return str(int(n)).zfill(2)
 
-    seen_terms = set()
-    rows = []
+    rows, seen = [], set()
+
+    # ---------- 策略 1：在可能的容器裡做「鄰近抽取」 ----------
+    containers = []
+    for sel in [
+        '[id*="today"]', '[class*="today"]',
+        '[id*="bingo"]', '[class*="bingo"]',
+        'main', 'section', 'article', 'table', 'div'
+    ]:
+        containers.extend(soup.select(sel))
+    containers = [c for c in containers if c.get_text(strip=True) and len(c.get_text()) > 500]
 
     for cont in containers:
         text = cont.get_text(" ", strip=True)
         for m in term_re.finditer(text):
             term = int(m.group(1))
-            if term in seen_terms:
+            if term in seen:
                 continue
-            start = max(0, m.start() - 240)
-            end   = min(len(text), m.end() + 240)
+            start = max(0, m.start() - 320)
+            end   = min(len(text), m.end() + 320)
             window = text[start:end]
             mnum = nums_re.search(window)
             if not mnum:
                 continue
-            raw = re.findall(r"\\d{1,2}", mnum.group(0))
+            raw = re.findall(r"\d{1,2}", mnum.group(0))
             if len(raw) != 20:
                 continue
             open_order = [z2(x) for x in raw]
             super_n = int(open_order[-1])
-            # draw_time：保存今天日期（具體時間以 API 為準）
             draw_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            row = {
+            rows.append({
                 "draw_term": term,
                 "draw_time": draw_time,
                 "open_order": open_order,
                 "super_number": super_n,
                 "high_low": None,
                 "odd_even": None,
-            }
-            rows.append(row)
-            seen_terms.add(term)
+            })
+            seen.add(term)
 
+    # ---------- 策略 2：整頁文字回掃（容器策略抓不到時） ----------
+    if not rows:
+        full_text = soup.get_text(" ", strip=True)
+        for m in term_re.finditer(full_text):
+            term = int(m.group(1))
+            if term in seen:
+                continue
+            start = max(0, m.start() - 360)
+            end   = min(len(full_text), m.end() + 360)
+            window = full_text[start:end]
+            mnum = nums_re.search(window)
+            if not mnum:
+                continue
+            raw = re.findall(r"\d{1,2}", mnum.group(0))
+            if len(raw) != 20:
+                continue
+            open_order = [z2(x) for x in raw]
+            super_n = int(open_order[-1])
+            draw_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            rows.append({
+                "draw_term": term,
+                "draw_time": draw_time,
+                "open_order": open_order,
+                "super_number": super_n,
+                "high_low": None,
+                "odd_even": None,
+            })
+            seen.add(term)
+
+    # ---------- 策略 3：掃描 <script> 內可能嵌入的 JSON ----------
+    if not rows:
+        scripts = soup.find_all("script")
+        for sc in scripts:
+            txt = sc.string or sc.get_text() or ""
+            if not txt or len(txt) < 200:
+                continue
+            # 抓出疑似「20顆球陣列」的 JSON 片段
+            # 例如: "openNumbers":[12,34,...,20個] 或 [ {numbers:[...20個...]}, ...]
+            # 這裡先抓「一段內含 20 個 1~80 的數字」的列表作為候選
+            arrs = re.findall(r"\[(?:\s*\d{1,2}\s*,){19}\s*\d{1,2}\s*\]", txt)
+            for arr in arrs:
+                nums = re.findall(r"\d{1,2}", arr)
+                if len(nums) != 20:
+                    continue
+                # 嘗試在同一段 script 附近找期別
+                # 往前後各掃一些字元
+                pos = txt.find(arr)
+                start = max(0, pos - 400)
+                end   = min(len(txt), pos + 400)
+                win   = txt[start:end]
+                mterm = term_re.search(win)
+                if not mterm:
+                    continue
+                term = int(mterm.group(1))
+                if term in seen:
+                    continue
+                open_order = [z2(x) for x in nums]
+                super_n = int(open_order[-1])
+                draw_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                rows.append({
+                    "draw_term": term,
+                    "draw_time": draw_time,
+                    "open_order": open_order,
+                    "super_number": super_n,
+                    "high_low": None,
+                    "odd_even": None,
+                })
+                seen.add(term)
+
+    # 去重後依期別排序（舊→新）
     rows = sorted({r["draw_term"]: r for r in rows}.values(), key=lambda x: x["draw_term"])
+    print(f"[BACKFILL SOURCE] url={used_url} parsed={len(rows)}", file=sys.stderr)
     return rows
 
 def upsert_many(rows: list[dict]) -> int:
@@ -364,6 +458,14 @@ def manifest():
 @app.get("/sw.js")
 def sw():
     return send_from_directory("static", "sw.js", mimetype="text/javascript")
+@app.get("/debug/last-html")
+def debug_last_html():
+    """只讀：把上一輪補齊時存的原始 HTML 回給你檢視（方便調整 selector）。"""
+    path = os.path.join("data", "last_today.html")
+    if not os.path.isfile(path):
+        return "No last_today.html yet", 404
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 if __name__ == "__main__":
     # 在 Render 上請把 Start Command 設為：python app.py
