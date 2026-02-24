@@ -5,6 +5,8 @@ from datetime import datetime, date, timedelta
 from collections import Counter
 from flask import Flask, jsonify, render_template, send_from_directory, request
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---- 基本設定 ----
 API_URL  = os.getenv("BINGO_API_URL", "https://api.taiwanlottery.com/TLCAPIWeB/Lottery/LatestBingoResult")
@@ -65,9 +67,14 @@ def upsert_row(row: dict):
 
 # ---- 擷取官網最新一期 ----
 def fetch_latest():
-    r = requests.get(API_URL, timeout=10)
+    # 關鍵：verify=False 以略過台彩 API 在 Render 上的嚴格憑證驗證問題
+    r = requests.get(API_URL, timeout=10, verify=False)
     r.raise_for_status()
-    post = r.json()["content"]["lotteryBingoLatestPost"]
+    data = r.json()
+
+    # 依照台彩官方回傳結構取值（lotteryBingoLatestPost）
+    post = data["content"]["lotteryBingoLatestPost"]
+
     return {
         "draw_term": int(post["drawTerm"]),
         "draw_time": post["dDate"],
