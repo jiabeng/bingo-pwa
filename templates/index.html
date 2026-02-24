@@ -19,7 +19,13 @@
   </style>
 </head>
 <body>
-  <h1>🎯 Bingo Bingo 今日即時報表（PWA）</h1>
+  <h1>🎯 Bingo Bingo 今日即時報表</h1>
+  
+  <button onclick="forceUpdate()"
+  style="padding:8px 12px;border-radius:8px;background:#0ea5e9;color:#fff;border:none;cursor:pointer;">
+  🔄 立即更新
+</button>
+  
   <div class="muted">資料以台彩官網 API 為準。請理性小注。</div>
 
   <div id="summary" class="card">載入中…</div>
@@ -59,6 +65,20 @@
       <h2>去重序列（新→舊）</h2>
       <div>${rec||'-'}</div>
     `;
+  }
+  async function forceUpdate(){
+    try{
+      const res = await fetch('/api/force-update', { method: 'POST' });
+      const data = await res.json();
+      if(data.ok){
+        alert("已強制更新！最新期別：" + data.latest.draw_term);
+        loadToday(); // 更新畫面
+      }else{
+        alert("更新失敗：" + (data.error || 'unknown'));
+      }
+    }catch(err){
+      alert("更新失敗：" + err);
+    }
   }
   if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').catch(console.error); }
   loadToday(); setInterval(loadToday, 30000);
