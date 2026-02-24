@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, json, csv, sqlite3, threading, time
+import os, sys, json, csv, sqlite3, threading, time, re
 from datetime import datetime, date, timedelta
 from collections import Counter
 from flask import Flask, jsonify, render_template, send_from_directory, request
 import requests
+from bs4 import BeautifulSoup
 
+# —— 在 Render 上略過不完整憑證鏈的驗證警告（台彩 API/官網 HTML）——
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---- 基本設定 ----
 API_URL  = os.getenv("BINGO_API_URL", "https://api.taiwanlottery.com/TLCAPIWeB/Lottery/LatestBingoResult")
@@ -52,6 +56,7 @@ def append_csv(row: dict):
         })
 
 def upsert_row(row: dict):
+    """單筆：同一期就覆寫（確保最新資料），不同期會新增。"""
     cur = CONN.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO bingo_super(draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at)"
@@ -59,27 +64,18 @@ def upsert_row(row: dict):
         (
             row["draw_term"], row["draw_time"], row["super_number"],
             json.dumps(row["open_order"], ensure_ascii=False),
-            row["high_low"], row["odd_even"], row["fetched_at"]
+            row.get("high_low"), row.get("odd_even"), row["fetched_at"]
         )
     )
     CONN.commit()
 
 # ---- 擷取官網最新一期 ----
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 def fetch_latest():
-    # 關鍵：Render 主機無法通過台彩 API 的 SSL 驗證
-    # verify=False 可忽略不完整的憑證鏈
+    # Render 對台彩 API 憑證鏈嚴格：加 verify=False 以通過
     r = requests.get(API_URL, timeout=10, verify=False)
-
     r.raise_for_status()
     data = r.json()
-
-    # 台彩最新開獎資料的結構：
-    # data["content"]["lotteryBingoLatestPost"]
     post = data["content"]["lotteryBingoLatestPost"]
-
     return {
         "draw_term": int(post["drawTerm"]),
         "draw_time": post["dDate"],
@@ -90,7 +86,7 @@ def fetch_latest():
         "fetched_at": datetime.now().isoformat(timespec='seconds')
     }
 
-# ---- 背景擷取：改為「每逢整 5 分鐘」 ----
+# ---- 每逢整 5 分鐘（07:00、07:05、…）的睡眠計算 ----
 def seconds_until_next_five_minute():
     now = datetime.now()
     current_block = (now.minute // 5) * 5
@@ -101,6 +97,7 @@ def seconds_until_next_five_minute():
         next_time = now.replace(minute=next_block, second=0, microsecond=0)
     return (next_time - now).total_seconds()
 
+# ---- 背景：每整 5 分鐘抓「最新一期」 ----
 def polling_loop():
     while True:
         try:
@@ -110,9 +107,129 @@ def polling_loop():
         except Exception as e:
             print("[WARN] fetch failure:", e, file=sys.stderr)
         # 對齊到下一個整 5 分鐘
-        time.sleep(max(1, int(seconds_until_next_five_minute())))
+        sleep_s = max(1, int(seconds_until_next_five_minute()))
+        time.sleep(sleep_s)
 
 threading.Thread(target=polling_loop, daemon=True).start()
+
+# ---- HTML 解析：抓取今天所有已開獎期數（官網公開頁面）----
+def parse_today_from_official_html():
+    """
+    從台彩 Bingo Bingo 官方今日頁面抓取『今天所有已開獎期別』。
+    回傳 list[dict]（與 DB 欄位對齊）：
+      { draw_term:int, draw_time:strISO(只保日), open_order:list[str], super_number:int, high_low, odd_even }
+    """
+    candidate_urls = [
+        "https://www.taiwanlottery.com/lottery/Lotto/BingoBingo",
+    ]
+    ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36"}
+
+    html = None
+    for url in candidate_urls:
+        try:
+            res = requests.get(url, headers=ua, timeout=12, verify=False)
+            if res.status_code == 200 and len(res.text) > 1500:
+                html = res.text
+                break
+        except Exception as e:
+            print("[WARN] fetch official html failed:", e, file=sys.stderr)
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    # 嘗試找大型容器（保守做法），再用 regex 抽取期別與 20 顆數字
+    containers = []
+    for sel in ['[id*="today"]','[class*="today"]','[id*="bingo"]','[class*="bingo"]','section','div']:
+        containers.extend(soup.select(sel))
+    containers = [c for c in containers if c.get_text(strip=True) and len(c.get_text()) > 500]
+
+    term_re = re.compile(r"(?:第)?(\d{8,12})\s*期")
+    nums_re = re.compile(r"(?:(?:^|\\D)(\\d{1,2})(?!\\d)(?:(?:\\s|,|、|，))+){19}(\\d{1,2})(?!\\d)")
+
+    def z2(n: str) -> str:
+        return str(int(n)).zfill(2)
+
+    seen_terms = set()
+    rows = []
+
+    for cont in containers:
+        text = cont.get_text(" ", strip=True)
+        for m in term_re.finditer(text):
+            term = int(m.group(1))
+            if term in seen_terms:
+                continue
+            start = max(0, m.start() - 240)
+            end   = min(len(text), m.end() + 240)
+            window = text[start:end]
+            mnum = nums_re.search(window)
+            if not mnum:
+                continue
+            raw = re.findall(r"\\d{1,2}", mnum.group(0))
+            if len(raw) != 20:
+                continue
+            open_order = [z2(x) for x in raw]
+            super_n = int(open_order[-1])
+            # draw_time：保存今天日期（具體時間以 API 為準）
+            draw_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            row = {
+                "draw_term": term,
+                "draw_time": draw_time,
+                "open_order": open_order,
+                "super_number": super_n,
+                "high_low": None,
+                "odd_even": None,
+            }
+            rows.append(row)
+            seen_terms.add(term)
+
+    rows = sorted({r["draw_term"]: r for r in rows}.values(), key=lambda x: x["draw_term"])
+    return rows
+
+def upsert_many(rows: list[dict]) -> int:
+    """批次寫入今天多期，使用 INSERT OR IGNORE 確保不重覆。"""
+    cur = CONN.cursor()
+    inserted = 0
+    for r in rows:
+        try:
+            cur.execute(
+                "INSERT OR IGNORE INTO bingo_super(draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    r["draw_term"],
+                    r["draw_time"],
+                    r["super_number"],
+                    json.dumps(r["open_order"], ensure_ascii=False),
+                    r.get("high_low"),
+                    r.get("odd_even"),
+                    datetime.now().isoformat(timespec='seconds')
+                )
+            )
+            inserted += cur.rowcount  # 1 or 0
+        except Exception as e:
+            print("[WARN] insert fail:", e, file=sys.stderr)
+    CONN.commit()
+    return inserted
+
+def backfill_today_once() -> dict:
+    """抓取官方 HTML → 解析 → 寫入 DB，回傳插入筆數與解析數"""
+    rows = parse_today_from_official_html()
+    if not rows:
+        return {"ok": False, "inserted": 0, "parsed": 0}
+    inserted = upsert_many(rows)
+    return {"ok": True, "inserted": inserted, "parsed": len(rows)}
+
+# ---- 背景：每 30 分鐘自動補齊一次今天資料 ----
+def backfill_scheduler_loop():
+    while True:
+        try:
+            info = backfill_today_once()
+            print("[BACKFILL]", info, file=sys.stderr)
+        except Exception as e:
+            print("[BACKFILL ERR]", e, file=sys.stderr)
+        time.sleep(30 * 60)  # 30 分鐘後再試
+
+threading.Thread(target=backfill_scheduler_loop, daemon=True).start()
 
 # ---- 當日統計 + 推薦 ----
 def parse_dt(dt_str: str) -> datetime:
@@ -201,7 +318,7 @@ def latest():
         "fetched_at": ft
     })
 
-# 🔘 立即更新（前端一按就強制抓一次）
+# 🔘 立即更新（只抓最新一期）
 @app.post("/api/force-update")
 def force_update():
     try:
@@ -212,8 +329,19 @@ def force_update():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+# 📅 一鍵補齊今天所有資料（解析官網 HTML）
+@app.post("/api/fetch-today-full")
+def api_fetch_today_full():
+    info = backfill_today_once()
+    return jsonify(info)
+
+@app.get("/api/today-count")
+def api_today_count():
+    rows = query_today_rows()
+    return jsonify({"ok": True, "today_count": len(rows)})
+
 @app.get("/api/today")
-def today():
+def today_api():
     rows = query_today_rows()
     supers = [r["super_number"] for r in rows]
     freq_top = Counter(supers).most_common(TOP_K) if supers else []
@@ -238,4 +366,5 @@ def sw():
     return send_from_directory("static", "sw.js", mimetype="text/javascript")
 
 if __name__ == "__main__":
+    # 在 Render 上請把 Start Command 設為：python app.py
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
