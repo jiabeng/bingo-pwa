@@ -32,6 +32,7 @@ SCHEMA_SQL = (
     " odd_even TEXT,"
     " fetched_at TEXT NOT NULL)"
 )
+
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(SCHEMA_SQL)
