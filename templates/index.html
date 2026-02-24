@@ -11,22 +11,24 @@
   <style>
     body{font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans TC",sans-serif; margin:16px;}
     h1{font-size:20px;margin:8px 0} h2{font-size:18px;margin:12px 0}
-    .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04);} 
+    .card{border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin:12px 0;box-shadow:0 1px 2px rgba(0,0,0,.04);}
     .pill{display:inline-block;background:#eef;border-radius:999px;padding:4px 8px;margin:2px;}
     table{width:100%;border-collapse:collapse;margin-top:8px}
     th,td{border:1px solid #e5e7eb;padding:6px 8px;text-align:center}
     .muted{color:#6b7280;font-size:12px}
+    .btn{padding:8px 12px;border-radius:8px;color:#fff;border:none;cursor:pointer}
+    .btn-refresh{background:#0ea5e9}
+    .btn-backfill{background:#10b981;margin-left:8px}
   </style>
 </head>
 <body>
   <h1>🎯 Bingo Bingo 今日即時報表</h1>
-  
-  <button onclick="forceUpdate()"
-  style="padding:8px 12px;border-radius:8px;background:#0ea5e9;color:#fff;border:none;cursor:pointer;">
-  🔄 立即更新
-</button>
-  
-  <div class="muted">資料以台彩官網 API 為準。請理性小注。</div>
+
+  <!-- 兩個操作按鈕 -->
+  <button class="btn btn-refresh" onclick="forceUpdate()">🔄 立即更新</button>
+  <button class="btn btn-backfill" onclick="fetchTodayFull()">📅 補齊今天所有資料</button>
+
+  <div class="muted">資料以台彩官網為準。請理性小注。</div>
 
   <div id="summary" class="card">載入中…</div>
   <div id="recommend" class="card"></div>
@@ -45,6 +47,7 @@
       <div>最新期別：<b>${latest? latest.draw_term : '-'}</b> / 最新超級獎號：<b>${latest? latest.super_number : '-'}</b></div>
       <div class="muted">更新時間：${new Date().toLocaleString()}</div>
     `;
+
     document.getElementById('recommend').innerHTML = `
       <h2>下注號碼推薦</h2>
       <div>單押：${s.recommend.pick1.map(n=>`<span class="pill">${n}</span>`).join('') || '-'}</div>
@@ -52,11 +55,13 @@
       <div>五押：${s.recommend.pick5.map(n=>`<span class="pill">${n}</span>`).join('') || '-'}</div>
       <div class="muted">邏輯：${s.recommend.rationale}</div>
     `;
+
     const topRows = s.freq_top.map((x,i)=>`<tr><td>${i+1}</td><td>${x.number}</td><td>${x.count}</td></tr>`).join('');
     document.getElementById('hot').innerHTML = `
       <h2>今日熱度（Top）</h2>
       <table><thead><tr><th>排名</th><th>號碼</th><th>次數</th></tr></thead><tbody>${topRows||'<tr><td colspan="3">尚無資料</td></tr>'}</tbody></table>
     `;
+
     const l20 = s.last20.slice().reverse().map(n=>`<span class="pill">${n}</span>`).join('');
     const rec = s.recency_unique.map(n=>`<span class="pill">${n}</span>`).join('');
     document.getElementById('last20').innerHTML = `
@@ -66,6 +71,8 @@
       <div>${rec||'-'}</div>
     `;
   }
+
+  // 🔄 立即更新：只抓最新一期
   async function forceUpdate(){
     try{
       const res = await fetch('/api/force-update', { method: 'POST' });
@@ -80,8 +87,26 @@
       alert("更新失敗：" + err);
     }
   }
+
+  // 📅 補齊今天所有資料（解析官網 HTML）
+  async function fetchTodayFull(){
+    try{
+      const res = await fetch('/api/fetch-today-full', { method: 'POST' });
+      const data = await res.json();
+      if(data.ok){
+        alert(`補齊完成：解析 ${data.parsed} 筆 / 新增 ${data.inserted} 筆`);
+        loadToday();
+      }else{
+        alert(`補齊未成功：解析 0 筆（若持續為 0，請告訴我以調整解析規則）`);
+      }
+    }catch(err){
+      alert("補齊失敗：" + err);
+    }
+  }
+
   if('serviceWorker' in navigator){ navigator.serviceWorker.register('/sw.js').catch(console.error); }
-  loadToday(); setInterval(loadToday, 30000);
+  loadToday();
+  setInterval(loadToday, 30000);
 </script>
 </body>
 </html>
