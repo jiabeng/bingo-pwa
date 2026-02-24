@@ -123,12 +123,10 @@ def parse_today_from_official_html(debug_save=True):
       2) 先用較寬鬆的 selector 找大容器，再以 regex 就近抽期別+20顆球
       3) 退而求其次：全頁文字回掃（global regex）
       4) 再退：掃描 <script> 內的 JSON（若頁面是前端框架渲染，常有嵌入資料）
-      5) 失敗時會把 HTML 存到 data/last_today.html 以便之後調整 selector
+      5) 失敗時把 HTML 存到 data/last_today.html 以便之後調整 selector
     """
     candidate_urls = [
         "https://www.taiwanlottery.com/lottery/Lotto/BingoBingo",
-        # 日後若官網提供日期參數，可在此補上變體
-        # f"https://www.taiwanlottery.com/lottery/Lotto/BingoBingo?Date={date.today().isoformat()}",
     ]
     ua = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"}
 
@@ -147,7 +145,7 @@ def parse_today_from_official_html(debug_save=True):
     if not html:
         return []
 
-    # 除錯：把原始 HTML 存一份，方便必要時檢視頁面實際結構
+    # 除錯：保存原始 HTML
     if debug_save:
         try:
             os.makedirs("data", exist_ok=True)
@@ -158,9 +156,8 @@ def parse_today_from_official_html(debug_save=True):
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # 正則：期別（8~12位數）與 20 顆球
+    # 正則：期別（8~12位數）與「允許多種分隔符」的 20 顆球
     term_re = re.compile(r"(?:第)?(\d{8,12})\s*期")
-    # 允許「數字 + 分隔符」連續19次，最後一顆再接一個數字（總共20顆）
     nums_re = re.compile(r"(?:(?:^|\D)(\d{1,2})(?!\d)(?:(?:\s|,|、|，|．|・|:|；|/|-))+){19}(\d{1,2})(?!\d)")
 
     def z2(n: str) -> str:
@@ -168,13 +165,9 @@ def parse_today_from_official_html(debug_save=True):
 
     rows, seen = [], set()
 
-    # ---------- 策略 1：在可能的容器裡做「鄰近抽取」 ----------
+    # 策略 1：在可能的容器中做鄰近抽取
     containers = []
-    for sel in [
-        '[id*="today"]', '[class*="today"]',
-        '[id*="bingo"]', '[class*="bingo"]',
-        'main', 'section', 'article', 'table', 'div'
-    ]:
+    for sel in ['[id*="today"]','[class*="today"]','[id*="bingo"]','[class*="bingo"]','main','section','article','table','div']:
         containers.extend(soup.select(sel))
     containers = [c for c in containers if c.get_text(strip=True) and len(c.get_text()) > 500]
 
@@ -206,7 +199,7 @@ def parse_today_from_official_html(debug_save=True):
             })
             seen.add(term)
 
-    # ---------- 策略 2：整頁文字回掃（容器策略抓不到時） ----------
+    # 策略 2：整頁文字回掃（容器抓不到時）
     if not rows:
         full_text = soup.get_text(" ", strip=True)
         for m in term_re.finditer(full_text):
@@ -235,23 +228,18 @@ def parse_today_from_official_html(debug_save=True):
             })
             seen.add(term)
 
-    # ---------- 策略 3：掃描 <script> 內可能嵌入的 JSON ----------
+    # 策略 3：掃描 <script> 內可能嵌入的 JSON（若頁面以 JS 注入資料）
     if not rows:
         scripts = soup.find_all("script")
         for sc in scripts:
             txt = sc.string or sc.get_text() or ""
             if not txt or len(txt) < 200:
                 continue
-            # 抓出疑似「20顆球陣列」的 JSON 片段
-            # 例如: "openNumbers":[12,34,...,20個] 或 [ {numbers:[...20個...]}, ...]
-            # 這裡先抓「一段內含 20 個 1~80 的數字」的列表作為候選
             arrs = re.findall(r"\[(?:\s*\d{1,2}\s*,){19}\s*\d{1,2}\s*\]", txt)
             for arr in arrs:
                 nums = re.findall(r"\d{1,2}", arr)
                 if len(nums) != 20:
                     continue
-                # 嘗試在同一段 script 附近找期別
-                # 往前後各掃一些字元
                 pos = txt.find(arr)
                 start = max(0, pos - 400)
                 end   = min(len(txt), pos + 400)
@@ -275,7 +263,6 @@ def parse_today_from_official_html(debug_save=True):
                 })
                 seen.add(term)
 
-    # 去重後依期別排序（舊→新）
     rows = sorted({r["draw_term"]: r for r in rows}.values(), key=lambda x: x["draw_term"])
     print(f"[BACKFILL SOURCE] url={used_url} parsed={len(rows)}", file=sys.stderr)
     return rows
@@ -458,14 +445,44 @@ def manifest():
 @app.get("/sw.js")
 def sw():
     return send_from_directory("static", "sw.js", mimetype="text/javascript")
-@app.get("/debug/last-html")
-def debug_last_html():
-    """只讀：把上一輪補齊時存的原始 HTML 回給你檢視（方便調整 selector）。"""
+
+# ====== Debug endpoints（避免 SW/快取造成 Loading）======
+@app.get("/debug/last-html-head")
+def debug_last_html_head():
+    """回傳前 2000 字，快速檢視 HTML 是否寫入。"""
     path = os.path.join("data", "last_today.html")
     if not os.path.isfile(path):
-        return "No last_today.html yet", 404
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read(), 200, {"Content-Type": "text/html; charset=utf-8"}
+        return "No last_today.html yet (請先在首頁按「補齊今天」)", 404
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        head = f.read(2000)
+    return f"<pre style='white-space:pre-wrap;font-family:monospace'>{head}</pre>", 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+    }
+
+@app.get("/debug/last-html-download")
+def debug_last_html_download():
+    """強制下載整份 HTML，避免瀏覽器渲染造成卡住。"""
+    path = os.path.join("data", "last_today.html")
+    if not os.path.isfile(path):
+        return "No last_today.html yet (請先在首頁按「補齊今天」)", 404
+    size = os.path.getsize(path)
+    print(f"[DEBUG] last_today.html size={size} bytes", file=sys.stderr)
+    return send_file(path, as_attachment=True, download_name="last_today.html",
+                     mimetype="text/html")
+
+@app.get("/debug/last-html")
+def debug_last_html():
+    """原本路由的修正版：加 no-store，避免被 SW/快取干擾。"""
+    path = os.path.join("data", "last_today.html")
+    if not os.path.isfile(path):
+        return "No last_today.html yet (請先在首頁按「補齊今天」)", 404
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        html = f.read()
+    return html, 200, {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-store",
+    }
 
 if __name__ == "__main__":
     # 在 Render 上請把 Start Command 設為：python app.py
