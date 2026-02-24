@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os, sys, json, csv, sqlite3, threading, time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from collections import Counter
-from flask import Flask, jsonify, render_template, send_from_directory
+from flask import Flask, jsonify, render_template, send_from_directory, request
 import requests
 
 # ---- 基本設定 ----
-API_URL = os.getenv("BINGO_API_URL", "https://api.taiwanlottery.com/TLCAPIWeB/Lottery/LatestBingoResult")
+API_URL  = os.getenv("BINGO_API_URL", "https://api.taiwanlottery.com/TLCAPIWeB/Lottery/LatestBingoResult")
 DB_PATH  = os.getenv("DB_PATH",  os.path.join("data", "bingo.db"))
 CSV_PATH = os.getenv("CSV_PATH", os.path.join("data", "bingo_super.csv"))
-POLL_SECS = int(os.getenv("POLL_SECS", "120"))   # 每 2 分鐘抓一次
-TOP_K = int(os.getenv("TOP_K", "10"))
+TOP_K    = int(os.getenv("TOP_K", "10"))
 MIN_TODAY_ROWS_FOR_RECO = int(os.getenv("MIN_TODAY_ROWS_FOR_RECO", "15"))
 
 os.makedirs("data", exist_ok=True)
-
 app = Flask(__name__)
 
 # ---- DB ----
@@ -29,24 +27,20 @@ SCHEMA_SQL = (
     " odd_even TEXT,"
     " fetched_at TEXT NOT NULL)"
 )
-
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.execute(SCHEMA_SQL)
     return conn
-
 CONN = db_conn()
-
 
 def append_csv(row: dict):
     exists = os.path.isfile(CSV_PATH)
     with open(CSV_PATH, 'a', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["draw_term","draw_time","super_number","open_order","high_low","odd_even","fetched_at"]
-        )
-        if not exists: writer.writeheader()
-        writer.writerow({
+        w = csv.DictWriter(f, fieldnames=[
+            "draw_term","draw_time","super_number","open_order","high_low","odd_even","fetched_at"
+        ])
+        if not exists: w.writeheader()
+        w.writerow({
             "draw_term": row["draw_term"],
             "draw_time": row["draw_time"],
             "super_number": row["super_number"],
@@ -56,12 +50,11 @@ def append_csv(row: dict):
             "fetched_at": row["fetched_at"],
         })
 
-
 def upsert_row(row: dict):
     cur = CONN.cursor()
     cur.execute(
-        "INSERT OR REPLACE INTO bingo_super(draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO bingo_super(draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             row["draw_term"], row["draw_time"], row["super_number"],
             json.dumps(row["open_order"], ensure_ascii=False),
@@ -71,7 +64,6 @@ def upsert_row(row: dict):
     CONN.commit()
 
 # ---- 擷取官網最新一期 ----
-
 def fetch_latest():
     r = requests.get(API_URL, timeout=10)
     r.raise_for_status()
@@ -86,28 +78,36 @@ def fetch_latest():
         "fetched_at": datetime.now().isoformat(timespec='seconds')
     }
 
-# ---- 背景擷取迴圈 ----
+# ---- 背景擷取：改為「每逢整 5 分鐘」 ----
+def seconds_until_next_five_minute():
+    now = datetime.now()
+    current_block = (now.minute // 5) * 5
+    next_block = current_block + 5
+    if next_block >= 60:
+        next_time = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    else:
+        next_time = now.replace(minute=next_block, second=0, microsecond=0)
+    return (next_time - now).total_seconds()
 
 def polling_loop():
     while True:
         try:
-            latest = fetch_latest()  # 以官網資料為準
+            latest = fetch_latest()
             upsert_row(latest)
             append_csv(latest)
         except Exception as e:
             print("[WARN] fetch failure:", e, file=sys.stderr)
-        time.sleep(POLL_SECS)
+        # 對齊到下一個整 5 分鐘
+        time.sleep(max(1, int(seconds_until_next_five_minute())))
 
 threading.Thread(target=polling_loop, daemon=True).start()
 
 # ---- 當日統計 + 推薦 ----
-
 def parse_dt(dt_str: str) -> datetime:
     try:
         return datetime.fromisoformat(dt_str)
     except Exception:
         return datetime.strptime(dt_str.replace('Z',''), "%Y-%m-%dT%H:%M:%S")
-
 
 def query_today_rows():
     today = date.today()
@@ -125,16 +125,13 @@ def query_today_rows():
             })
     return out
 
-
 def recency_unique(seq, take=20):
     last = list(seq)[-take:]
     seen, ordered = set(), []
-    for n in reversed(last):      # 新→舊 去重
+    for n in reversed(last):    # 新→舊 去重
         if n not in seen:
-            ordered.append(n)
-            seen.add(n)
+            ordered.append(n); seen.add(n)
     return ordered
-
 
 def recommend_numbers(today_supers, freq_top):
     if len(today_supers) >= MIN_TODAY_ROWS_FOR_RECO and freq_top:
@@ -164,7 +161,7 @@ def recommend_numbers(today_supers, freq_top):
         "rationale": "今日樣本不足：混合『今日熱度』+『近20期輪替前段』。"
     }
 
-# ---- Flask 視圖 ----
+# ---- Routes ----
 @app.get("/")
 def home():
     return render_template("index.html")
@@ -192,6 +189,17 @@ def latest():
         "fetched_at": ft
     })
 
+# 🔘 立即更新（前端一按就強制抓一次）
+@app.post("/api/force-update")
+def force_update():
+    try:
+        latest = fetch_latest()
+        upsert_row(latest)
+        append_csv(latest)
+        return jsonify({"ok": True, "latest": latest})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.get("/api/today")
 def today():
     rows = query_today_rows()
@@ -199,8 +207,7 @@ def today():
     freq_top = Counter(supers).most_common(TOP_K) if supers else []
     rec_u = recency_unique(supers, take=20) if supers else []
     reco = recommend_numbers(supers, freq_top) if supers else {"pick1":[], "pick3":[], "pick5":[], "rationale":"尚無資料"}
-
-    resp = {
+    return jsonify({
         "ok": True,
         "today_count": len(rows),
         "latest": rows[-1] if rows else None,
@@ -208,8 +215,7 @@ def today():
         "last20": supers[-20:],
         "recency_unique": rec_u,
         "recommend": reco
-    }
-    return jsonify(resp)
+    })
 
 @app.get("/manifest.webmanifest")
 def manifest():
