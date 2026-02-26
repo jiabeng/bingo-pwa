@@ -104,7 +104,7 @@ def safe_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 
         try:
             res = requests.get(url, headers=h, timeout=timeout, verify=False, allow_redirects=True)
             txt = res.text or ""
-            blocked = any(k in txt for k in ["cf-browser-verification", "Access denied", "Attention Required"]) or res.status_code in (403, 503)
+            blocked = any(k in txt for k in ("cf-browser-verification", "Access denied", "Attention Required")) or res.status_code in (403, 503)
             if blocked:
                 raise RuntimeError(f"blocked or challenged (status={res.status_code})")
             return res
@@ -182,8 +182,8 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
     ]
     ua_headers = {"Referer": "https://www.taiwanlottery.com.tw/"}
 
-    html = None
-    used_url = None
+    html: Optional[str] = None
+    used_url: Optional[str] = None
     last_error: Optional[str] = None
 
     for url in candidate_urls:
@@ -200,6 +200,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             last_error = str(e)
             continue
 
+    # 即使解析失敗也先把原始 HTML 落檔（方便你用 /debug 觀察）
     if html:
         try:
             os.makedirs("data", exist_ok=True)
@@ -213,6 +214,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
 
     soup = BeautifulSoup(html, "html.parser")
 
+    # 正則（raw string，避免任何跳脫問題）
     term_re = re.compile(r"(?:第)?(\d{8,12})\s*期")
     nums_re = re.compile(r"(?:(?:^|\D)(\d{1,2})(?!\d)(?:(?:\s|,|、|，|．|・|:|；|/|\-))+){19}(\d{1,2})(?!\d)")
 
@@ -222,6 +224,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
     rows: List[Dict[str, Any]] = []
     seen = set()
 
+    # 策略 1：容器鄰近抽取
     containers = []
     for sel in ['[id*="today"]','[class*="today"]','[id*="bingo"]','[class*="bingo"]','main','section','article','table','div']:
         containers.extend(soup.select(sel))
@@ -255,6 +258,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             })
             seen.add(term)
 
+    # 策略 2：全頁回掃
     if not rows:
         full_text = soup.get_text(" ", strip=True)
         for m in term_re.finditer(full_text):
@@ -283,9 +287,11 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             })
             seen.add(term)
 
+    # 策略 3：掃描 <script> 內嵌 JSON 陣列
     if not rows:
         scripts = soup.find_all("script")
-        arr_pattern = re.compile(r"\[(?:\s*"?\d{1,2}"?\s*,){19}\s*"?\d{1,2}"?\s*\]")
+        # 使用 raw string，避免 Python 轉義；同時允許引號存在
+        arr_pattern = re.compile(r"\[(?:\s*\"?\d{1,2}\"?\s*,){19}\s*\"?\d{1,2}\"?\s*\]")
         for sc in scripts:
             txt = sc.string or sc.get_text() or ""
             if not txt or len(txt) < 200:
@@ -463,8 +469,9 @@ def latest():
         "fetched_at": ft
     })
 
-# 🔘 立即更新（只抓最新一期）
-@app.post("/api/force-update")
+# 立即更新（只抓最新一期）
+@app.route("/api/force-update", methods=["GET", "POST"])  # 兩種方法都支援，避免誤觸 405
+
 def force_update():
     try:
         latest = fetch_latest()
@@ -475,7 +482,7 @@ def force_update():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# 📅 一鍵補齊今天所有資料（解析官網 HTML）— 同時支援 GET 與 POST
+# 一鍵補齊今天所有資料（解析官網 HTML）— 同時支援 GET 與 POST
 @app.route("/api/fetch-today-full", methods=["GET", "POST"])
 def api_fetch_today_full():
     info = backfill_today_once()
