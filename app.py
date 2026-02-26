@@ -1,4 +1,5 @@
-# app.py — fixed and hardened for Render (Bingo Bingo helper)
+
+# app.py — Render-hardened + GET/POST + JSON error handlers (Bingo Bingo helper)
 # -*- coding: utf-8 -*-
 import os, sys, json, csv, sqlite3, threading, time, re
 from datetime import datetime, date, timedelta
@@ -19,7 +20,6 @@ DB_PATH  = os.getenv("DB_PATH",  os.path.join("data", "bingo.db"))
 CSV_PATH = os.getenv("CSV_PATH", os.path.join("data", "bingo_super.csv"))
 TOP_K    = int(os.getenv("TOP_K", "10"))
 MIN_TODAY_ROWS_FOR_RECO = int(os.getenv("MIN_TODAY_ROWS_FOR_RECO", "15"))
-TZ = os.getenv("TZ", "Asia/Taipei")
 
 os.makedirs("data", exist_ok=True)
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -71,7 +71,6 @@ def append_csv(row: Dict[str, Any]):
         })
 
 def upsert_row(row: Dict[str, Any]):
-    """單筆：同一期就覆寫（確保最新資料），不同期會新增。"""
     cur = CONN.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO bingo_super(draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at)"
@@ -104,13 +103,12 @@ def safe_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 
     for attempt in range(max_retries):
         try:
             res = requests.get(url, headers=h, timeout=timeout, verify=False, allow_redirects=True)
-            # 若遇到 Cloudflare / 風控頁面，通常會帶特定關鍵字
             txt = res.text or ""
             blocked = any(k in txt for k in ["cf-browser-verification", "Access denied", "Attention Required"]) or res.status_code in (403, 503)
             if blocked:
                 raise RuntimeError(f"blocked or challenged (status={res.status_code})")
             return res
-        except Exception as e:
+        except Exception:
             if attempt == max_retries - 1:
                 raise
             time.sleep(delay + (0.2 * attempt))
@@ -119,15 +117,12 @@ def safe_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 
 # ---- 擷取官網最新一期（官方 API） ----
 
 def fetch_latest() -> Dict[str, Any]:
-    # Render 對台彩 API 憑證鏈嚴格：加 verify=False 以通過
     r = requests.get(API_URL, timeout=10, verify=False, headers={"Accept": "application/json"})
     r.raise_for_status()
     data = r.json()
     post = data.get("content", {}).get("lotteryBingoLatestPost") or {}
-    # 有些欄位名稱可能大小寫/型態不同，做防呆
     open_order = post.get("openShowOrder")
     if isinstance(open_order, str):
-        # 可能是以逗號/空白分隔
         parts = re.findall(r"\d{1,2}", open_order)
         open_order = [p.zfill(2) for p in parts]
     elif isinstance(open_order, list):
@@ -139,7 +134,6 @@ def fetch_latest() -> Dict[str, Any]:
         super_n = int(super_n)
     except Exception:
         super_n = int(open_order[-1]) if open_order else -1
-
     return {
         "draw_term": int(post.get("drawTerm", 0)),
         "draw_time": str(post.get("dDate", datetime.now().isoformat(timespec='seconds'))),
@@ -173,38 +167,20 @@ def polling_loop():
                 append_csv(latest)
         except Exception as e:
             print("[WARN] fetch failure:", e, file=sys.stderr)
-        # 對齊到下一個整 5 分鐘
-        sleep_s = max(5, seconds_until_next_five_minute())
-        time.sleep(sleep_s)
+        time.sleep(max(5, seconds_until_next_five_minute()))
 
 threading.Thread(target=polling_loop, daemon=True).start()
 
 # ---- HTML 解析：抓取今天所有已開獎期數（官網公開頁面）----
 
 def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, Any]]:
-    """
-    從台彩 Bingo Bingo 官方今日頁面抓取『今天所有已開獎期別』。
-    回傳 list[dict]:
-      { draw_term:int, draw_time:strISO(只保當日), open_order:list[str], super_number:int, high_low, odd_even }
-    策略：
-      1) 嘗試多個候選 URL（官網若調整路徑，任一可用即可）
-      2) 先用較鬆的 selector 找大容器，再以 regex 就近抽期別+20顆球
-      3) 退而求其次：全頁文字回掃（global regex）
-      4) 再退：掃描 <script> 內的 JSON（若頁面是前端框架渲染，常有嵌入資料）
-      5) 成功/失敗都把 HTML 存到 data/last_today.html 以便除錯
-    """
     candidate_urls = [
-        # 新域名/常見路徑
         "https://www.taiwanlottery.com.tw/lottery/Lotto/BingoBingo",
         "https://www.taiwanlottery.com.tw/lottery/Lotto/BingoBingo/index.html",
-        # 舊域名/備援
         "https://www.taiwanlottery.com/lottery/Lotto/BingoBingo",
         "https://www.taiwanlottery.com/lottery/Lotto/BingoBingo/index.html",
     ]
-
-    ua_headers = {
-        "Referer": "https://www.taiwanlottery.com.tw/",
-    }
+    ua_headers = {"Referer": "https://www.taiwanlottery.com.tw/"}
 
     html = None
     used_url = None
@@ -214,10 +190,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
         try:
             res = safe_get(url, headers=ua_headers, timeout=15, max_retries=4)
             txt = res.text or ""
-            # 基本條件：狀態碼OK + 長度足夠 + 關鍵字
-            if res.status_code == 200 and len(txt) > 1500 and (
-                "賓果賓果" in txt or "Bingo" in txt or "BINGO" in txt
-            ):
+            if res.status_code == 200 and len(txt) > 1500 and ("賓果賓果" in txt or "Bingo" in txt or "BINGO" in txt):
                 html = txt
                 used_url = url
                 break
@@ -227,7 +200,6 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             last_error = str(e)
             continue
 
-    # 除錯：保存原始 HTML（即使沒有解析成功也落檔，便於你查看）
     if html:
         try:
             os.makedirs("data", exist_ok=True)
@@ -241,9 +213,7 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # 正則：期別（8~12位數）與「允許多種分隔符」的 20 顆球
     term_re = re.compile(r"(?:第)?(\d{8,12})\s*期")
-    # 允許各種分隔（空白、逗號、頓號、冒號、斜線、破折等），抓 20 顆 1~2 位數
     nums_re = re.compile(r"(?:(?:^|\D)(\d{1,2})(?!\d)(?:(?:\s|,|、|，|．|・|:|；|/|\-))+){19}(\d{1,2})(?!\d)")
 
     def z2(n: str) -> str:
@@ -252,7 +222,6 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
     rows: List[Dict[str, Any]] = []
     seen = set()
 
-    # 策略 1：在可能的容器中做鄰近抽取
     containers = []
     for sel in ['[id*="today"]','[class*="today"]','[id*="bingo"]','[class*="bingo"]','main','section','article','table','div']:
         containers.extend(soup.select(sel))
@@ -286,7 +255,6 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             })
             seen.add(term)
 
-    # 策略 2：整頁文字回掃（容器抓不到時）
     if not rows:
         full_text = soup.get_text(" ", strip=True)
         for m in term_re.finditer(full_text):
@@ -315,15 +283,13 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
             })
             seen.add(term)
 
-    # 策略 3：掃描 <script> 內可能嵌入的 JSON（若頁面以 JS 注入資料）
     if not rows:
         scripts = soup.find_all("script")
-        arr_pattern = re.compile(r"\[(?:\s*\"?\d{1,2}\"?\s*,){19}\s*\"?\d{1,2}\"?\s*\]")
+        arr_pattern = re.compile(r"\[(?:\s*"?\d{1,2}"?\s*,){19}\s*"?\d{1,2}"?\s*\]")
         for sc in scripts:
             txt = sc.string or sc.get_text() or ""
             if not txt or len(txt) < 200:
                 continue
-            # 嘗試抓 openShowOrder 陣列
             for arr in arr_pattern.findall(txt):
                 nums = re.findall(r"\d{1,2}", arr)
                 if len(nums) != 20:
@@ -334,7 +300,6 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
                 win   = txt[start:end]
                 mterm = term_re.search(win)
                 if not mterm:
-                    # 若附近沒有期別，嘗試全段找期別，取最近的一個（退而求其次）
                     mm = list(term_re.finditer(txt))
                     if mm:
                         mterm = mm[-1]
@@ -363,7 +328,6 @@ def parse_today_from_official_html(debug_save: bool = True) -> List[Dict[str, An
 # ---- 資料庫批次寫入 ----
 
 def upsert_many(rows: List[Dict[str, Any]]) -> int:
-    """批次寫入今天多期，使用 INSERT OR IGNORE 確保不重覆。"""
     cur = CONN.cursor()
     inserted = 0
     for r in rows:
@@ -381,7 +345,7 @@ def upsert_many(rows: List[Dict[str, Any]]) -> int:
                     datetime.now().isoformat(timespec='seconds')
                 )
             )
-            inserted += cur.rowcount  # 1 or 0
+            inserted += cur.rowcount
         except Exception as e:
             print("[WARN] insert fail:", e, file=sys.stderr)
     CONN.commit()
@@ -389,7 +353,6 @@ def upsert_many(rows: List[Dict[str, Any]]) -> int:
 
 
 def backfill_today_once() -> Dict[str, Any]:
-    """抓取官方 HTML → 解析 → 寫入 DB，回傳插入筆數與解析數"""
     rows = parse_today_from_official_html()
     if not rows:
         return {"ok": False, "inserted": 0, "parsed": 0}
@@ -405,7 +368,7 @@ def backfill_scheduler_loop():
             print("[BACKFILL]", info, file=sys.stderr)
         except Exception as e:
             print("[BACKFILL ERR]", e, file=sys.stderr)
-        time.sleep(30 * 60)  # 30 分鐘後再試
+        time.sleep(30 * 60)
 
 threading.Thread(target=backfill_scheduler_loop, daemon=True).start()
 
@@ -438,7 +401,7 @@ def query_today_rows() -> List[Dict[str, Any]]:
 def recency_unique(seq: List[int], take: int = 20) -> List[int]:
     last = list(seq)[-take:]
     seen, ordered = set(), []
-    for n in reversed(last):    # 新→舊 去重
+    for n in reversed(last):
         if n not in seen:
             ordered.append(n); seen.add(n)
     return ordered
@@ -447,13 +410,9 @@ def recency_unique(seq: List[int], take: int = 20) -> List[int]:
 def recommend_numbers(today_supers: List[int], freq_top: List[Any]) -> Dict[str, Any]:
     if len(today_supers) >= MIN_TODAY_ROWS_FOR_RECO and freq_top:
         base = [n for (n, _) in freq_top]
-        return {
-            "pick1": base[:1],
-            "pick3": base[:3] if len(base) >= 3 else base,
-            "pick5": base[:5] if len(base) >= 5 else base,
-            "rationale": "使用『今日熱度排行』做等配分散。"
-        }
-    # 今日樣本不足 → 混合 今日Top + 近20期輪替前段
+        return {"pick1": base[:1], "pick3": base[:3] if len(base) >= 3 else base,
+                "pick5": base[:5] if len(base) >= 5 else base,
+                "rationale": "使用『今日熱度排行』做等配分散。"}
     cur = CONN.cursor()
     cur.execute("SELECT super_number FROM bingo_super ORDER BY draw_term ASC")
     all_supers = [int(r[0]) for r in cur.fetchall()]
@@ -465,18 +424,13 @@ def recommend_numbers(today_supers: List[int], freq_top: List[Any]) -> Dict[str,
     while len(pool) < 5 and rec_seq:
         x = rec_seq.pop(0)
         if x not in pool: pool.append(x)
-    return {
-        "pick1": pool[:1],
-        "pick3": pool[:3],
-        "pick5": pool[:5],
-        "rationale": "今日樣本不足：混合『今日熱度』+『近20期輪替前段』。"
-    }
+    return {"pick1": pool[:1], "pick3": pool[:3], "pick5": pool[:5],
+            "rationale": "今日樣本不足：混合『今日熱度』+『近20期輪替前段』。"}
 
 # ---- Routes ----
 
 @app.get("/")
 def home():
-    # 提供一個簡單頁面，避免 Render 404
     try:
         return render_template("index.html")
     except Exception:
@@ -493,8 +447,7 @@ def ping():
 @app.get("/api/latest")
 def latest():
     cur = CONN.cursor()
-    cur.execute("SELECT draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at "
-                "FROM bingo_super ORDER BY draw_term DESC LIMIT 1")
+    cur.execute("SELECT draw_term, draw_time, super_number, open_order, high_low, odd_even, fetched_at FROM bingo_super ORDER BY draw_term DESC LIMIT 1")
     row = cur.fetchone()
     if not row:
         return jsonify({"ok": False, "message": "no data"})
@@ -522,8 +475,8 @@ def force_update():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# 📅 一鍵補齊今天所有資料（解析官網 HTML）
-@app.post("/api/fetch-today-full")
+# 📅 一鍵補齊今天所有資料（解析官網 HTML）— 同時支援 GET 與 POST
+@app.route("/api/fetch-today-full", methods=["GET", "POST"])
 def api_fetch_today_full():
     info = backfill_today_once()
     return jsonify(info)
@@ -561,10 +514,9 @@ def sw():
 # ====== Debug endpoints（避免 SW/快取造成 Loading）======
 @app.get("/debug/last-html-head")
 def debug_last_html_head():
-    """回傳前 2000 字，快速檢視 HTML 是否寫入。"""
     path = os.path.join("data", "last_today.html")
     if not os.path.isfile(path):
-        return "No last_today.html yet (請先在首頁按「補齊今天」或呼叫 /api/fetch-today-full)", 404
+        return "No last_today.html yet (請先呼叫 /api/fetch-today-full)", 404
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         head = f.read(2000)
     return f"<pre style='white-space:pre-wrap;font-family:monospace'>{head}</pre>", 200, {
@@ -574,29 +526,48 @@ def debug_last_html_head():
 
 @app.get("/debug/last-html-download")
 def debug_last_html_download():
-    """強制下載整份 HTML，避免瀏覽器渲染造成卡住。"""
     path = os.path.join("data", "last_today.html")
     if not os.path.isfile(path):
-        return "No last_today.html yet (請先在首頁按「補齊今天」)", 404
-    size = os.path.getsize(path)
-    print(f"[DEBUG] last_today.html size={size} bytes", file=sys.stderr)
-    return send_file(path, as_attachment=True, download_name="last_today.html",
-                     mimetype="text/html")
+        return "No last_today.html yet (請先呼叫 /api/fetch-today-full)", 404
+    return send_file(path, as_attachment=True, download_name="last_today.html", mimetype="text/html")
 
 @app.get("/debug/last-html")
 def debug_last_html():
-    """原本路由的修正版：加 no-store，避免被 SW/快取干擾。"""
     path = os.path.join("data", "last_today.html")
     if not os.path.isfile(path):
-        return "No last_today.html yet (請先在首頁按「補齊今天」)", 404
+        return "No last_today.html yet (請先呼叫 /api/fetch-today-full)", 404
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         html = f.read()
-    return html, 200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store",
-    }
+    return html, 200, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
+
+# ---- API 統一錯誤處理（確保回 JSON，而不是 HTML）----
+from werkzeug.exceptions import HTTPException
+
+@app.errorhandler(404)
+def err_404(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "not_found", "path": request.path}), 404
+    return e, 404
+
+@app.errorhandler(405)
+def err_405(e):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "ok": False,
+            "error": "method_not_allowed",
+            "path": request.path,
+            "allowed": list(getattr(e, "valid_methods", []) or []),
+        }), 405
+    return e, 405
+
+@app.errorhandler(Exception)
+def err_500(e):
+    if request.path.startswith("/api/"):
+        code = 500
+        if isinstance(e, HTTPException):
+            code = e.code or 500
+        return jsonify({"ok": False, "error": str(e)}), code
+    raise e
 
 if __name__ == "__main__":
-    # 在 Render 上：建議 Start Command 改為：gunicorn app:app --preload --timeout 120 --workers 2
-    # 若暫時無法改，用下行 dev server 亦可（注意非生產用）：
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
